@@ -13,7 +13,7 @@ run_remote_script_with_option() {
         printf "Error: The remote script encountered an error.\n" >&2
         return 1
     fi
-
+clear
     printf "Remote script finished successfully.\n"
     return 0
 }
