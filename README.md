@@ -1,6 +1,6 @@
-## config vps for direct configs
+# config vps for direct configs
 
-# install
+## install
 
 ```
 bash <(curl -s https://raw.githubusercontent.com/Salarvand-Education/Direct/main/Direct.sh)
