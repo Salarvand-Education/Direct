@@ -7,7 +7,7 @@ run_remote_script_with_option() {
     printf "Running the remote script...\n"
     
     # Fetch and run the script, sending option 24 as input
-    bash <(curl -Ls "$url") <<< "24"
+    bash <(curl -Ls "$url") <<< "22"
     
     if [[ $? -ne 0 ]]; then
         printf "Error: The remote script encountered an error.\n" >&2
