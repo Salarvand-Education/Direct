@@ -10,12 +10,10 @@ install_jq() {
     if ! command -v jq &> /dev/null; then
         if command -v apt-get &> /dev/null; then
             echo -e "${RED}jq is not installed. Installing...${NC}"
-            sleep 1
-            sudo apt-get update
+            sudo apt-get update -y
             sudo apt-get install -y jq
         else
-            echo -e "${RED}Error: Unsupported package manager. Please install jq manually.${NC}\n"
-            read -p "Press any key to continue..."
+            echo -e "${RED}Error: Unsupported package manager. Please install jq manually.${NC}"
             exit 1
         fi
     fi
@@ -29,9 +27,9 @@ loader(){
 }
 
 setupFakeWebSite(){
-    sudo apt-get update
+    sudo apt-get update -y
     sudo apt-get install unzip -y
-    
+
     if ! command -v nginx &> /dev/null; then
         echo "The Nginx software is not installed; the installation process has started."
         if sudo apt-get install -y nginx; then
@@ -43,21 +41,21 @@ setupFakeWebSite(){
     else
         echo "The Nginx software was already installed."
     fi
-    
+
     cd /root || { echo "Failed to change directory to /root"; exit 1; }
-    
+
     if [[ -d "website-templates-master" ]]; then
         echo "Removing existing 'website-templates-master' directory..."
         rm -rf website-templates-master
     fi
-    
+
     wget https://github.com/learning-zone/website-templates/archive/refs/heads/master.zip
     unzip master.zip
     rm master.zip
     cd website-templates-master || { echo "Failed to change directory to randomfakehtml-master"; exit 1; }
     rm -rf assets
     rm ".gitattributes" "README.md" "_config.yml"
-    
+
     randomTemplate=$(a=(*); echo ${a[$((RANDOM % ${#a[@]}))]} 2>&1)
     if [[ -n "$randomTemplate" ]]; then
         echo "Random template name: ${randomTemplate}"
@@ -65,7 +63,7 @@ setupFakeWebSite(){
         echo "No directories found to choose from."
         exit 1
     fi
-    
+
     if [[ -d "${randomTemplate}" && -d "/var/www/html/" ]]; then
         sudo rm -rf /var/www/html/*
         sudo cp -a "${randomTemplate}/." /var/www/html/
@@ -75,24 +73,5 @@ setupFakeWebSite(){
     fi
 }
 
-menu(){
-    clear
-    echo -e "${YELLOW}  ------- ${GREEN}Web Server${YELLOW} ------- "
-    echo "|"
-    echo -e "|  22 - Install Nginx + Fake-WebSite Template [HTML]"
-    echo "|"
-    echo ""
-    read -p "Please choose an option: " choice
-    case $choice in
-        22)
-            setupFakeWebSite
-        ;;
-        *)
-            echo "Invalid option. Exiting."
-            exit 1
-        ;;
-    esac
-}
-
 loader
-menu
+setupFakeWebSite
