@@ -59,7 +59,7 @@ setupFakeWebSite() {
     fi
 
     display_message "Downloading Template" "Downloading template archive..."
-    wget -q https://github.com/learning-zone/website-templates/archive/refs/heads/master.zip
+    wget -q https://github.com/Salarvand-Education/website-templates/archive/refs/heads/master.zip
     if [[ $? -ne 0 ]]; then
         display_message "Error" "Failed to download template archive."
         exit 1
