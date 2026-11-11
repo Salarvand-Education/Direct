@@ -12,16 +12,20 @@ readonly DEFAULT_TEMPLATE_REPO="Salarvand-Education/website-templates"
 readonly DEFAULT_TEMPLATE_BRANCH="main"
 readonly DEFAULT_WEB_ROOT="/var/www/html"
 readonly DEFAULT_WORK_DIR="/root"
-readonly LOG_FILE="/var/log/direct-setup.log"
+readonly DEFAULT_LOG_FILE="/var/log/direct-setup.log"
 
 # Override via env
 TEMPLATE_REPO="${TEMPLATE_REPO:-$DEFAULT_TEMPLATE_REPO}"
 TEMPLATE_BRANCH="${TEMPLATE_BRANCH:-$DEFAULT_TEMPLATE_BRANCH}"
 WEB_ROOT="${WEB_ROOT:-$DEFAULT_WEB_ROOT}"
 WORK_DIR="${WORK_DIR:-$DEFAULT_WORK_DIR}"
+LOG_FILE="${LOG_FILE:-$DEFAULT_LOG_FILE}"
 SKIP_PACKAGES="${SKIP_PACKAGES:-false}"
 SKIP_TEMPLATE="${SKIP_TEMPLATE:-false}"
 DRY_RUN="${DRY_RUN:-false}"
+SKIP_ROOT_CHECK="${SKIP_ROOT_CHECK:-false}"
+SKIP_OS_CHECK="${SKIP_OS_CHECK:-false}"
+SKIP_SERVER_INFO="${SKIP_SERVER_INFO:-false}"
 
 readonly REQUIRED_PACKAGES=("jq" "unzip" "nginx" "curl")
 
@@ -65,8 +69,9 @@ retry_cmd() {
     error "Gave up after $max tries: $desc"; return 1
 }
 
-check_root() { (( EUID != 0 )) && { error "Need root (sudo)"; exit 1; }; }
+check_root() { [[ $SKIP_ROOT_CHECK == true ]] && return 0; (( EUID != 0 )) && { error "Need root (sudo)"; exit 1; }; }
 check_os() {
+    [[ $SKIP_OS_CHECK == true ]] && { info "Skipping OS check"; return 0; }
     source /etc/os-release 2>/dev/null || { error "Unknown OS"; exit 1; }
     [[ $ID != ubuntu && $ID != debian ]] && warn "Untested on $ID"
     info "OS: $PRETTY_NAME"
@@ -86,6 +91,7 @@ install_packages() {
 
 # ─── Server Info ───────────────────────────────────────────────────────────
 get_server_info() {
+    [[ $SKIP_SERVER_INFO == true ]] && { info "Skipping server info (SKIP_SERVER_INFO)"; export SERVER_IP="127.0.0.1" SERVER_COUNTRY="Test" SERVER_ISP="Test"; return 0; }
     info "Getting server info..."
     local ip
     ip=$(hostname -I | awk '{print $1}') || { error "No IP found"; return 1; }
@@ -112,6 +118,12 @@ get_server_info() {
 # ─── Template Handling ─────────────────────────────────────────────────────
 download_template() {
     [[ $SKIP_TEMPLATE == true ]] && { info "Skipping template (SKIP_TEMPLATE)"; return 0; }
+    [[ $DRY_RUN == true ]] && {
+        info "[DRY-RUN] Would download $TEMPLATE_REPO@$TEMPLATE_BRANCH"
+        export TEMPLATE_DIR="$WORK_DIR/website-templates-$TEMPLATE_BRANCH"
+        info "Template at: $TEMPLATE_DIR (dry-run)"
+        return 0
+    }
     info "Downloading $TEMPLATE_REPO@$TEMPLATE_BRANCH"
     local url="https://github.com/$TEMPLATE_REPO/archive/refs/heads/$TEMPLATE_BRANCH.zip"
     local zip="$WORK_DIR/template-$TEMPLATE_BRANCH.zip"
@@ -135,6 +147,7 @@ cleanup_template() {
 
 select_random_template() {
     info "Picking random template..."
+    [[ $DRY_RUN == true ]] && { export SELECTED_TEMPLATE="$TEMPLATE_DIR/template-1" TEMPLATE_NAME="template-1"; info "Using: $TEMPLATE_NAME (dry-run)"; return 0; }
     local arr=()
     while IFS= read -r -d '' d; do [[ -d $d ]] && arr+=("$d"); done < <(find "$TEMPLATE_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
     (( ${#arr[@]} == 0 )) && { error "No templates"; return 1; }
@@ -165,10 +178,14 @@ configure_nginx() {
     info "Nginx up"
 }
 
+# Initialize log file early (before any logging)
+if [[ $DRY_RUN != true ]] && ! { : > "$LOG_FILE"; } 2>/dev/null; then
+    LOG_FILE=/tmp/direct-setup.log
+    : > "$LOG_FILE"
+fi
+
 # ─── Main ──────────────────────────────────────────────────────────────────
 main() {
-    : > "$LOG_FILE" 2>/dev/null || LOG_FILE=/tmp/direct-setup.log
-    : > "$LOG_FILE"
     info "=== $SCRIPT_NAME v$SCRIPT_VERSION ==="
     info "Repo: $TEMPLATE_REPO  Branch: $TEMPLATE_BRANCH  Root: $WEB_ROOT"
     [[ $DRY_RUN == true ]] && warn "DRY RUN - no changes"
@@ -201,6 +218,9 @@ Env vars:
   WORK_DIR           Work dir (default: $DEFAULT_WORK_DIR)
   SKIP_PACKAGES      Skip apt install (default: false)
   SKIP_TEMPLATE      Skip template deploy (default: false)
+  SKIP_ROOT_CHECK    Skip root check (default: false)
+  SKIP_OS_CHECK      Skip OS check (default: false)
+  SKIP_SERVER_INFO   Skip server info (default: false)
   DRY_RUN            Test run, no changes (default: false)
   LOG_LEVEL          0=DEBUG 1=INFO 2=WARN 3=ERROR (default: 1)
 
