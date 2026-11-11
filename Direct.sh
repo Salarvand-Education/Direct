@@ -9,7 +9,7 @@ set -euo pipefail
 readonly SCRIPT_NAME="Direct.sh"
 readonly SCRIPT_VERSION="2.0.0"
 readonly DEFAULT_TEMPLATE_REPO="Salarvand-Education/website-templates"
-readonly DEFAULT_TEMPLATE_BRANCH="main"
+readonly DEFAULT_TEMPLATE_BRANCH="master"
 readonly DEFAULT_WEB_ROOT="/var/www/html"
 readonly DEFAULT_WORK_DIR="/root"
 readonly DEFAULT_LOG_FILE="/var/log/direct-setup.log"
