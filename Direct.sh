@@ -111,7 +111,13 @@ retry_cmd_shell() {
     error "Gave up after $max tries: $desc"; return 1
 }
 
-check_root() { [[ $SKIP_ROOT_CHECK == true ]] && return 0; (( EUID != 0 )) && { error "Need root (sudo)"; exit 1; }; }
+check_root() {
+    [[ $SKIP_ROOT_CHECK == true ]] && return 0
+    if (( EUID != 0 )); then
+        error "Need root (sudo)"
+        exit 1
+    fi
+}
 detect_os() {
     local id="" version_id="" pretty_name=""
     if [[ -r /etc/os-release ]]; then
