@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
 # Direct.sh - VPS Configuration for Direct Configs
-# Version: 2.0.0
+# Version: 2.1.0 (Fixed)
 
 set -euo pipefail
 
 # ─── Config ────────────────────────────────────────────────────────────────
 readonly SCRIPT_NAME="Direct.sh"
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly DEFAULT_TEMPLATE_REPO="Salarvand-Education/website-templates"
 readonly DEFAULT_TEMPLATE_BRANCH="master"
 readonly DEFAULT_WEB_ROOT="/var/www/html"
@@ -26,24 +26,41 @@ DRY_RUN="${DRY_RUN:-false}"
 SKIP_ROOT_CHECK="${SKIP_ROOT_CHECK:-false}"
 SKIP_OS_CHECK="${SKIP_OS_CHECK:-false}"
 SKIP_SERVER_INFO="${SKIP_SERVER_INFO:-false}"
+LOG_JSON="${LOG_JSON:-false}"
 
-readonly REQUIRED_PACKAGES=("jq" "unzip" "nginx" "curl")
+# Package names by OS family
+declare -A REQUIRED_PACKAGES=(
+    [debian]="jq unzip nginx curl"
+    [ubuntu]="jq unzip nginx curl"
+    [rhel]="jq unzip nginx curl"
+    [fedora]="jq unzip nginx curl"
+    [alpine]="jq unzip nginx curl"
+)
 
 # ─── Colors & Logging ──────────────────────────────────────────────────────
 readonly RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[0;33m' BLUE='\033[0;34m' NC='\033[0m'
 readonly LOG_DEBUG=0 LOG_INFO=1 LOG_WARN=2 LOG_ERROR=3
 CURRENT_LOG_LEVEL=${LOG_LEVEL:-$LOG_INFO}
 
+_log_json() {
+    local level=$1 msg=$2 ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    printf '{"timestamp":"%s","level":%d,"message":"%s"}\n' "$ts" "$level" "$msg"
+}
+
 _log() {
     local level=$1 msg=$2 ts
     ts=$(date '+%Y-%m-%d %H:%M:%S')
+    if [[ $LOG_JSON == true ]]; then
+        _log_json "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
+    fi
     case $level in
         $LOG_DEBUG) [[ $CURRENT_LOG_LEVEL -le $LOG_DEBUG ]] && echo -e "${BLUE}[DEBUG]${NC} $msg" ;;
         $LOG_INFO)  [[ $CURRENT_LOG_LEVEL -le $LOG_INFO ]]  && echo -e "${GREEN}[INFO]${NC} $msg" ;;
         $LOG_WARN)  [[ $CURRENT_LOG_LEVEL -le $LOG_WARN ]]  && echo -e "${YELLOW}[WARN]${NC} $msg" ;;
         $LOG_ERROR) [[ $CURRENT_LOG_LEVEL -le $LOG_ERROR ]] && echo -e "${RED}[ERROR]${NC} $msg" ;;
     esac
-    echo "[$ts] [$level] $msg" >> "$LOG_FILE" 2>/dev/null || true
+    [[ $LOG_JSON != true ]] && echo "[$ts] [$level] $msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 debug() { _log $LOG_DEBUG "$1"; }
 info()  { _log $LOG_INFO "$1"; }
@@ -52,63 +69,149 @@ error() { _log $LOG_ERROR "$1"; }
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
 run_cmd() {
-    local cmd=$1 desc=${2:-$1}
+    local desc=$1
+    shift
+    local cmd=("$@")
+    [[ $DRY_RUN == true ]] && { info "[DRY-RUN] $desc"; return 0; }
+    debug "Running: ${cmd[*]}"
+    "${cmd[@]}" >> "$LOG_FILE" 2>&1 && { debug "OK: $desc"; return 0; } || {
+        error "Failed: $desc (code $?)"; return 1; }
+}
+
+run_cmd_shell() {
+    local desc=$1
+    local cmd=$2
     [[ $DRY_RUN == true ]] && { info "[DRY-RUN] $desc"; return 0; }
     debug "Running: $cmd"
-    eval "$cmd" >> "$LOG_FILE" 2>&1 && { debug "OK: $desc"; return 0; } || {
+    bash -c "$cmd" >> "$LOG_FILE" 2>&1 && { debug "OK: $desc"; return 0; } || {
         error "Failed: $desc (code $?)"; return 1; }
 }
 
 retry_cmd() {
-    local max=3 delay=2 i=1 cmd=$1 desc=${2:-$1}
+    local max=3 delay=2 i=1 desc=$1
+    shift
+    local cmd=("$@")
     while (( i <= max )); do
-        run_cmd "$cmd" "$desc (try $i/$max)" && return 0
+        run_cmd "$desc (try $i/$max)" "${cmd[@]}" && return 0
         (( i < max )) && { warn "Retry in ${delay}s..."; sleep $delay; delay=$((delay*2)); }
         ((i++))
     done
     error "Gave up after $max tries: $desc"; return 1
 }
 
-check_root() { [[ $SKIP_ROOT_CHECK == true ]] && return 0; (( EUID != 0 )) && { error "Need root (sudo)"; exit 1; }; }
-check_os() {
-    [[ $SKIP_OS_CHECK == true ]] && { info "Skipping OS check"; return 0; }
-    source /etc/os-release 2>/dev/null || { error "Unknown OS"; exit 1; }
-    [[ $ID != ubuntu && $ID != debian ]] && warn "Untested on $ID"
-    info "OS: $PRETTY_NAME"
+retry_cmd_shell() {
+    local max=3 delay=2 i=1 desc=$1
+    shift
+    local cmd=$1
+    while (( i <= max )); do
+        run_cmd_shell "$desc (try $i/$max)" "$cmd" && return 0
+        (( i < max )) && { warn "Retry in ${delay}s..."; sleep $delay; delay=$((delay*2)); }
+        ((i++))
+    done
+    error "Gave up after $max tries: $desc"; return 1
 }
 
-# ─── Package Install ───────────────────────────────────────────────────────
+check_root() {
+    [[ $SKIP_ROOT_CHECK == true ]] && return 0
+    if (( EUID != 0 )); then
+        error "Need root (sudo)"
+        exit 1
+    fi
+}
+
+# Safe OS detection without sourcing untrusted file
+detect_os() {
+    local id="" version_id="" pretty_name=""
+    local os_release="/etc/os-release"
+    [[ -L "$os_release" ]] && os_release=$(readlink -f "$os_release")
+    if [[ -r "$os_release" ]]; then
+        id=$(grep '^ID=' "$os_release" | head -1 | cut -d= -f2 | tr -d '"')
+        version_id=$(grep '^VERSION_ID=' "$os_release" | head -1 | cut -d= -f2 | tr -d '"')
+        pretty_name=$(grep '^PRETTY_NAME=' "$os_release" | head -1 | cut -d= -f2 | tr -d '"')
+    fi
+    [[ -z $id ]] && { error "Unknown OS (cannot parse /etc/os-release)"; exit 1; }
+    export OS_ID=$id OS_VERSION_ID=$version_id OS_PRETTY_NAME=$pretty_name
+}
+
+check_os() {
+    [[ $SKIP_OS_CHECK == true ]] && { info "Skipping OS check"; return 0; }
+    detect_os
+    case $OS_ID in
+        ubuntu|debian|rhel|fedora|alpine) info "OS: $OS_PRETTY_NAME" ;;
+        *) warn "Untested on $OS_ID ($OS_PRETTY_NAME)" ;;
+    esac
+}
+
+# Package manager detection
+get_pkg_manager() {
+    case $OS_ID in
+        ubuntu|debian) echo "apt-get" ;;
+        rhel|fedora)   echo "dnf" ;;
+        alpine)        echo "apk" ;;
+        *)             echo "apt-get" ;;
+    esac
+}
+
 install_packages() {
-    [[ $SKIP_PACKAGES == true ]] && { info "Skipping apt (SKIP_PACKAGES)"; return 0; }
-    info "Installing: ${REQUIRED_PACKAGES[*]}"
-    run_cmd "apt-get update -y" "apt update" || return 1
-    for p in "${REQUIRED_PACKAGES[@]}"; do
-        command -v "$p" &>/dev/null && info "$p OK" || {
-            info "Installing $p..."; run_cmd "apt-get install -y $p" "install $p" || return 1; }
-    done
+    [[ $SKIP_PACKAGES == true ]] && { info "Skipping package install (SKIP_PACKAGES)"; return 0; }
+    check_os
+    local pkg_mgr
+    pkg_mgr=$(get_pkg_manager)
+    local packages="${REQUIRED_PACKAGES[$OS_ID]:-${REQUIRED_PACKAGES[debian]}}"
+    info "Installing: $packages (via $pkg_mgr)"
+    case $pkg_mgr in
+        apt-get)
+            run_cmd "apt update" apt-get update -y || return 1
+            # shellcheck disable=SC2086
+            run_cmd "apt install packages" apt-get install -y $packages || return 1
+            ;;
+        dnf)
+            run_cmd "dnf install packages" dnf install -y $packages || return 1
+            ;;
+        apk)
+            run_cmd "apk update" apk update || return 1
+            run_cmd "apk add packages" apk add $packages || return 1
+            ;;
+    esac
     info "Packages done"
 }
 
 # ─── Server Info ───────────────────────────────────────────────────────────
 get_server_info() {
-    [[ $SKIP_SERVER_INFO == true ]] && { info "Skipping server info (SKIP_SERVER_INFO)"; export SERVER_IP="127.0.0.1" SERVER_COUNTRY="Test" SERVER_ISP="Test"; return 0; }
+    [[ $SKIP_SERVER_INFO == true ]] && {
+        info "Skipping server info (SKIP_SERVER_INFO)"
+        export SERVER_IP="127.0.0.1" SERVER_COUNTRY="Test" SERVER_ISP="Test"
+        return 0
+    }
     info "Getting server info..."
-    local ip
-    ip=$(hostname -I | awk '{print $1}') || { error "No IP found"; return 1; }
-    [[ -z $ip ]] && { error "Empty IP"; return 1; }
+
+    # Robust IP detection with fallback
+    local ip=""
+    if command -v ip >/dev/null 2>&1; then
+        ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+    fi
+    [[ -z $ip ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [[ -z $ip ]] && { error "No IP found"; return 1; }
     info "IP: $ip"
 
-    local country="" isp=""
-    country=$(curl -sS --max-time 10 "http://ip-api.com/json/$ip?fields=country,isp" 2>/dev/null | jq -r '.country // empty' 2>/dev/null) && \
-    isp=$(curl -sS --max-time 10 "http://ip-api.com/json/$ip?fields=country,isp" 2>/dev/null | jq -r '.isp // empty' 2>/dev/null)
+    # Single curl call for both country and isp
+    local country="" isp="" geo_json=""
+    geo_json=$(curl -sS --max-time 30 "http://ip-api.com/json/$ip?fields=country,isp" 2>/dev/null) || true
+    if [[ -n $geo_json ]]; then
+        country=$(echo "$geo_json" | jq -r '.country // empty' 2>/dev/null) || country=""
+        isp=$(echo "$geo_json" | jq -r '.isp // empty' 2>/dev/null) || isp=""
+    fi
 
     if [[ -z $country || -z $isp ]]; then
         debug "ip-api failed, trying ipinfo.io..."
         local fb
-        fb=$(curl -sS --max-time 10 "https://ipinfo.io/$ip/json" 2>/dev/null) || true
-        country=${country:-$(echo "$fb" | jq -r '.country // empty' 2>/dev/null)}
-        isp=${isp:-$(echo "$fb" | jq -r '.org // empty' 2>/dev/null)}
+        fb=$(curl -sS --max-time 30 "https://ipinfo.io/$ip/json" 2>/dev/null) || fb=""
+        [[ -n $fb ]] && {
+            country=${country:-$(echo "$fb" | jq -r '.country // empty' 2>/dev/null)}
+            isp=${isp:-$(echo "$fb" | jq -r '.org // empty' 2>/dev/null)}
+        }
     fi
+
     country=${country:-Unknown}
     isp=${isp:-Unknown}
     info "Country: $country | ISP: $isp"
@@ -116,6 +219,15 @@ get_server_info() {
 }
 
 # ─── Template Handling ─────────────────────────────────────────────────────
+verify_checksum() {
+    local file=$1 expected=$2
+    [[ -z $expected ]] && { warn "No checksum provided, skipping verification"; return 0; }
+    local actual
+    actual=$(sha256sum "$file" | awk '{print $1}')
+    [[ $actual == "$expected" ]] || { error "Checksum mismatch: expected $expected, got $actual"; return 1; }
+    info "Checksum verified"
+}
+
 download_template() {
     [[ $SKIP_TEMPLATE == true ]] && { info "Skipping template (SKIP_TEMPLATE)"; return 0; }
     [[ $DRY_RUN == true ]] && {
@@ -127,12 +239,28 @@ download_template() {
     info "Downloading $TEMPLATE_REPO@$TEMPLATE_BRANCH"
     local url="https://github.com/$TEMPLATE_REPO/archive/refs/heads/$TEMPLATE_BRANCH.zip"
     local zip="$WORK_DIR/template-$TEMPLATE_BRANCH.zip"
-    run_cmd "rm -rf '$WORK_DIR/website-templates-*' '$zip'" "Cleanup"
-    retry_cmd "curl -fsSL -o '$zip' '$url'" "Download" || return 1
+    run_cmd_shell "Cleanup" "rm -rf \"$WORK_DIR/website-templates-\"\"*\" \"$zip\""
+    # Try primary branch, fallback to master/main
+    if ! retry_cmd_shell "Download" "curl -fsSL --max-time 300 -o \"$zip\" \"$url\""; then
+        local fallback_branch="master"
+        [[ $TEMPLATE_BRANCH == "master" ]] && fallback_branch="main"
+        warn "Primary branch failed, trying $fallback_branch..."
+        url="https://github.com/$TEMPLATE_REPO/archive/refs/heads/$fallback_branch.zip"
+        zip="$WORK_DIR/template-$fallback_branch.zip"
+        run_cmd_shell "Cleanup" "rm -rf \"$WORK_DIR/website-templates-\"\"*\" \"$zip\""
+        retry_cmd_shell "Download (fallback)" "curl -fsSL --max-time 300 -o \"$zip\" \"$url\"" || return 1
+        TEMPLATE_BRANCH=$fallback_branch
+    fi
     [[ -s $zip ]] || { error "Empty zip"; return 1; }
-    run_cmd "cd '$WORK_DIR' && unzip -q '$zip'" "Unzip" || return 1
+
+    # Verify checksum if provided
+    local expected_checksum="${TEMPLATE_SHA256:-}"
+    verify_checksum "$zip" "$expected_checksum" || return 1
+
+    run_cmd_shell "Unzip" "cd \"$WORK_DIR\" && unzip -oq \"$zip\"" || return 1
     local dir
-    dir=$(find "$WORK_DIR" -maxdepth 1 -type d -name 'website-templates-*' | head -1)
+    # Find newest matching directory
+    dir=$(find "$WORK_DIR" -maxdepth 1 -type d -name 'website-templates-*' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
     [[ -z $dir ]] && { error "Template dir missing"; return 1; }
     export TEMPLATE_DIR=$dir
     info "Template at: $TEMPLATE_DIR"
@@ -140,48 +268,92 @@ download_template() {
 
 cleanup_template() {
     info "Removing junk from template..."
-    for p in assets .gitattributes README.md _config.yml "*.md" LICENSE*; do
-        run_cmd "find '$TEMPLATE_DIR' -name '$p' -exec rm -rf {} +" "rm $p" || true
-    done
+    local patterns=("assets" ".gitattributes" "README.md" "_config.yml" "LICENSE*")
+    # Use find with multiple -name predicates combined with -o
+    run_cmd_shell "Cleanup template" "find \"$TEMPLATE_DIR\" \( -name 'assets' -o -name '.gitattributes' -o -name 'README.md' -o -name '_config.yml' -o -name 'LICENSE*' -o -name '*.md' \) -exec rm -rf {} +" || true
+    # Remove .md files separately (glob in find)
+    run_cmd_shell "Remove .md files" "find \"$TEMPLATE_DIR\" -name '*.md' -exec rm -f {} +" || true
 }
 
 select_random_template() {
     info "Picking random template..."
-    [[ $DRY_RUN == true ]] && { export SELECTED_TEMPLATE="$TEMPLATE_DIR/template-1" TEMPLATE_NAME="template-1"; info "Using: $TEMPLATE_NAME (dry-run)"; return 0; }
+    [[ $DRY_RUN == true ]] && {
+        export SELECTED_TEMPLATE="$TEMPLATE_DIR/template-1"
+        export TEMPLATE_NAME="template-1"
+        info "Using: $TEMPLATE_NAME (dry-run)"
+        return 0
+    }
     local arr=()
-    while IFS= read -r -d '' d; do [[ -d $d ]] && arr+=("$d"); done < <(find "$TEMPLATE_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
-    (( ${#arr[@]} == 0 )) && { error "No templates"; return 1; }
+    # Use mapfile to avoid subshell (bash 4.4+)
+    if [[ ${BASH_VERSINFO[0]} -ge 4 && ${BASH_VERSINFO[1]} -ge 4 ]]; then
+        mapfile -d '' arr < <(find "$TEMPLATE_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+    else
+        # Fallback for older bash
+        while IFS= read -r -d '' d; do [[ -d $d ]] && arr+=("$d"); done < <(find "$TEMPLATE_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+    fi
+    (( ${#arr[@]} == 0 )) && { error "No templates found in $TEMPLATE_DIR"; return 1; }
     local pick=${arr[$((RANDOM % ${#arr[@]}))]}
-    export SELECTED_TEMPLATE=$pick TEMPLATE_NAME=$(basename "$pick")
+    export SELECTED_TEMPLATE=$pick
+    export TEMPLATE_NAME=$(basename "$pick")
     info "Using: $TEMPLATE_NAME"
 }
 
 deploy_template() {
     info "Deploying to $WEB_ROOT..."
-    [[ -d $WEB_ROOT ]] || run_cmd "mkdir -p '$WEB_ROOT'" "mkdir webroot" || return 1
-    [[ -n $(ls -A "$WEB_ROOT" 2>/dev/null) ]] && {
-        run_cmd "mv '$WEB_ROOT' '/var/www/html.backup.$(date +%s)'" "backup old" || true
-        run_cmd "mkdir -p '$WEB_ROOT'" "recreate webroot" || return 1; }
-    run_cmd "cp -a '$SELECTED_TEMPLATE/.' '$WEB_ROOT/'" "copy files" || return 1
-    run_cmd "chown -R www-data:www-data '$WEB_ROOT'" "fix owner" || true
-    run_cmd "find '$WEB_ROOT' -type f -exec chmod 644 {} +" "file perms" || true
-    run_cmd "find '$WEB_ROOT' -type d -exec chmod 755 {} +" "dir perms" || true
+    [[ -d $WEB_ROOT ]] || run_cmd "mkdir webroot" mkdir -p "$WEB_ROOT" || return 1
+    if [[ -n $(ls -A "$WEB_ROOT" 2>/dev/null) ]]; then
+        local backup_path="${WEB_ROOT}.backup.$(date +%s)"
+        run_cmd "backup old" mv "$WEB_ROOT" "$backup_path" || true
+        run_cmd "recreate webroot" mkdir -p "$WEB_ROOT" || return 1
+    fi
+    run_cmd "copy files" cp -a "$SELECTED_TEMPLATE/." "$WEB_ROOT/" || return 1
+
+    # Detect web user
+    local web_user="www-data"
+    id "$web_user" >/dev/null 2>&1 || web_user="nginx"
+    id "$web_user" >/dev/null 2>&1 || web_user="apache"
+    run_cmd "fix owner" chown -R "$web_user:$web_user" "$WEB_ROOT" || true
+    run_cmd "file perms" find "$WEB_ROOT" -type f -exec chmod 644 {} + || true
+    run_cmd "dir perms" find "$WEB_ROOT" -type d -exec chmod 755 {} + || true
     info "Deployed: $TEMPLATE_NAME"
 }
 
 # ─── Nginx ─────────────────────────────────────────────────────────────────
 configure_nginx() {
-    info "Setting up Nginx..."
-    run_cmd "nginx -t" "test config" || return 1
-    run_cmd "systemctl enable nginx" "enable" || true
-    run_cmd "systemctl restart nginx" "restart" || return 1
-    info "Nginx up"
+    info "Setting up Nginx on port 8082..."
+
+    # Generate nginx config for port 8082
+    cat > /etc/nginx/sites-available/default << 'NGINXEOF'
+server {
+    listen 8082;
+    listen [::]:8082;
+    root /var/www/html;
+    index index.html index.htm;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+NGINXEOF
+
+    run_cmd "test config" nginx -t || return 1
+    run_cmd "enable" systemctl enable nginx || true
+    run_cmd "restart" systemctl restart nginx || return 1
+
+    # Health check on port 8082
+    sleep 2
+    if curl -sf --max-time 5 http://localhost:8082/ >/dev/null 2>&1; then
+        info "Nginx health check passed on port 8082"
+    else
+        warn "Nginx health check failed on port 8082 (may still be starting)"
+    fi
+    info "Nginx up on port 8082"
 }
 
-# Initialize log file early (before any logging)
-if [[ $DRY_RUN != true ]] && ! { : > "$LOG_FILE"; } 2>/dev/null; then
-    LOG_FILE=/tmp/direct-setup.log
-    : > "$LOG_FILE"
+# Initialize log file early
+if [[ $DRY_RUN != true ]]; then
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || LOG_FILE="/tmp/direct-setup.log"
+    : > "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/direct-setup.log"
 fi
 
 # ─── Main ──────────────────────────────────────────────────────────────────
@@ -189,20 +361,33 @@ main() {
     info "=== $SCRIPT_NAME v$SCRIPT_VERSION ==="
     info "Repo: $TEMPLATE_REPO  Branch: $TEMPLATE_BRANCH  Root: $WEB_ROOT"
     [[ $DRY_RUN == true ]] && warn "DRY RUN - no changes"
-    check_root; check_os
+    check_root
+    check_os
     install_packages || exit 1
+
+    # Validate preconditions after SKIP flags
+    if [[ $SKIP_PACKAGES == true ]]; then
+        command -v nginx >/dev/null 2>&1 || { error "SKIP_PACKAGES=true but nginx not installed"; exit 1; }
+        command -v jq >/dev/null 2>&1 || { error "SKIP_PACKAGES=true but jq not installed"; exit 1; }
+        command -v unzip >/dev/null 2>&1 || { error "SKIP_PACKAGES=true but unzip not installed"; exit 1; }
+        command -v curl >/dev/null 2>&1 || { error "SKIP_PACKAGES=true but curl not installed"; exit 1; }
+    fi
+
     get_server_info || exit 1
-    [[ $SKIP_TEMPLATE != true ]] && {
+
+    if [[ $SKIP_TEMPLATE != true ]]; then
         download_template || exit 1
         cleanup_template || exit 1
         select_random_template || exit 1
         deploy_template || exit 1
-    }
+    fi
+
     configure_nginx || exit 1
+
     info "=== Done ==="
     info "IP: $SERVER_IP  Country: $SERVER_COUNTRY  ISP: $SERVER_ISP"
     [[ $SKIP_TEMPLATE != true ]] && info "Template: $TEMPLATE_NAME"
-    info "Web: $WEB_ROOT  Nginx: $(systemctl is-active nginx 2>/dev/null || echo unknown)"
+    info "Web: $WEB_ROOT  Nginx: $(systemctl is-active nginx 2>/dev/null || echo unknown)  Port: 8082"
 }
 
 # ─── Help ──────────────────────────────────────────────────────────────────
@@ -223,12 +408,21 @@ Env vars:
   SKIP_SERVER_INFO   Skip server info (default: false)
   DRY_RUN            Test run, no changes (default: false)
   LOG_LEVEL          0=DEBUG 1=INFO 2=WARN 3=ERROR (default: 1)
+  LOG_JSON           JSON structured logging (default: false)
+  TEMPLATE_SHA256    Expected SHA256 of template zip (optional)
 
 Examples:
   TEMPLATE_REPO="me/myrepo" bash <(curl -s ...)
   SKIP_TEMPLATE=true bash <(curl -s ...)
   DRY_RUN=true bash <(curl -s ...)
+  TEMPLATE_SHA256="abc123..." bash <(curl -s ...)
+  LOG_JSON=true LOG_LEVEL=0 bash <(curl -s ...)
 EOF
 }
-case ${1:-} in -h|--help) show_help; exit 0;; -v|--version) echo "$SCRIPT_NAME v$SCRIPT_VERSION"; exit 0;; esac
+
+case ${1:-} in
+    -h|--help) show_help; exit 0 ;;
+    -v|--version) echo "$SCRIPT_NAME v$SCRIPT_VERSION"; exit 0 ;;
+esac
+
 main "$@"
